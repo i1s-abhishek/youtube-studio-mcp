@@ -78,11 +78,7 @@ def http_json(
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        try:
-            parsed = json.loads(body)
-        except json.JSONDecodeError:
-            parsed = {"error": {"message": body or str(exc)}}
-        raise RuntimeError(parsed.get("error", {}).get("message", body or str(exc))) from exc
+        raise RuntimeError(_extract_error_message(body, exc)) from exc
 
 
 def http_empty(
@@ -101,11 +97,23 @@ def http_empty(
             return json.loads(body) if body else {}
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        try:
-            parsed = json.loads(body)
-        except json.JSONDecodeError:
-            parsed = {"error": {"message": body or str(exc)}}
-        raise RuntimeError(parsed.get("error", {}).get("message", body or str(exc))) from exc
+        raise RuntimeError(_extract_error_message(body, exc)) from exc
+
+
+def _extract_error_message(body: str, exc: Exception) -> str:
+    """Extract a human-readable error message from a Google API error response.
+
+    Handles both dict-style errors ({"error": {"message": "..."}})
+    and string-style errors ({"error": "invalid_grant"}).
+    """
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return body or str(exc)
+    error = parsed.get("error", body or str(exc))
+    if isinstance(error, dict):
+        return error.get("message", body or str(exc))
+    return str(error)
 
 
 @dataclass
@@ -171,11 +179,16 @@ class YouTubeClient:
 
     def _access_token(self) -> str:
         token = self.auth.load_token()
+        if not token.get("access_token"):
+            raise RuntimeError("Token file is missing access_token. Run scripts/auth.py first.")
         expires_in = int(token.get("expires_in", 0))
         created_at = int(token.get("created_at", 0))
-        if not token.get("access_token"):
-            raise RuntimeError("Token file is missing access_token.")
-        if created_at + max(expires_in - 120, 0) <= int(time.time()):
+        if created_at and expires_in:
+            expiry = created_at + max(expires_in - 120, 0)
+            if expiry <= int(time.time()):
+                token = self._refresh_token(token)
+        elif not created_at:
+            # Token file missing created_at — try refresh to get a fresh token
             token = self._refresh_token(token)
         return token["access_token"]
 
@@ -617,9 +630,10 @@ class McpServer:
             line = sys.stdin.buffer.readline()
             if not line:
                 return None
-            if line == b"\r\n":
+            stripped = line.strip()
+            if not stripped:
                 break
-            key, _, value = line.decode("utf-8").partition(":")
+            key, _, value = stripped.decode("utf-8").partition(":")
             headers[key.strip().lower()] = value.strip()
         length = int(headers.get("content-length", "0"))
         if length <= 0:
