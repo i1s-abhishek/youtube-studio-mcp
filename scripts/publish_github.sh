@@ -2,6 +2,14 @@
 
 set -euo pipefail
 
+# Always operate on this script's own repository, never the caller's cwd.
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+if [[ "$(basename "$(git rev-parse --show-toplevel)")" != "youtube-studio-mcp" ]]; then
+  echo "Refusing to publish: $(pwd) is not the youtube-studio-mcp repository."
+  exit 1
+fi
+
 OWNER="${1:-i1s-abhishek}"
 REPO="${2:-youtube-studio-mcp}"
 DESCRIPTION="Local MCP server for YouTube metadata, thumbnails, comments, and analytics."
@@ -17,11 +25,10 @@ if ! gh auth status >/dev/null 2>&1; then
   exit 1
 fi
 
-git remote remove origin >/dev/null 2>&1 || true
-
 if gh repo view "${OWNER}/${REPO}" >/dev/null 2>&1; then
   echo "Repository already exists: ${OWNER}/${REPO}"
 else
+  git remote remove origin >/dev/null 2>&1 || true
   gh repo create "${OWNER}/${REPO}" \
     --public \
     --description "${DESCRIPTION}" \
@@ -29,7 +36,11 @@ else
     --remote origin
 fi
 
-git remote set-url origin "https://github.com/${OWNER}/${REPO}.git"
+if git remote get-url origin >/dev/null 2>&1; then
+  git remote set-url origin "https://github.com/${OWNER}/${REPO}.git"
+else
+  git remote add origin "https://github.com/${OWNER}/${REPO}.git"
+fi
 git push -u origin main
 
 gh repo edit "${OWNER}/${REPO}" \
