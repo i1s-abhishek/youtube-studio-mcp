@@ -36,7 +36,7 @@ See [Demo](docs/demo.md) for a setup walkthrough.
 - Read channel and per-video YouTube Analytics reports.
 - Post and list top-level video comments.
 - Runs locally over stdio with no hosted backend.
-- Uses only the Python standard library at runtime.
+- Two server options: a FastMCP server (`scripts/mcp_server.py`, recommended) and a zero-dependency stdlib-only server (`scripts/server.py`).
 
 ## Why this exists
 
@@ -79,11 +79,19 @@ Authenticate with Google:
 python3 scripts/auth.py auth
 ```
 
-Configure your MCP client to run:
+Install the MCP SDK (required by the recommended server):
 
 ```bash
-python3 scripts/server.py
+pip install mcp
 ```
+
+Configure your MCP client to run the FastMCP server (recommended):
+
+```bash
+python3 scripts/mcp_server.py
+```
+
+Alternatively, `scripts/server.py` is a zero-dependency server that uses only the Python standard library — use it if you cannot install the `mcp` package.
 
 See [Google OAuth Setup](docs/setup-google-oauth.md) and [MCP Client Configuration](docs/mcp-client-config.md) for detailed steps.
 
@@ -96,7 +104,7 @@ Example stdio config:
   "mcpServers": {
     "youtube-studio": {
       "command": "python3",
-      "args": ["./scripts/server.py"],
+      "args": ["./scripts/mcp_server.py"],
       "cwd": "/absolute/path/to/youtube-studio-mcp",
       "env": {
         "YOUTUBE_CLIENT_SECRETS": "./secrets/client_secret.json",
@@ -107,7 +115,7 @@ Example stdio config:
 }
 ```
 
-Replace `/absolute/path/to/youtube-studio-mcp` with the path where you cloned this repository.
+Replace `/absolute/path/to/youtube-studio-mcp` with the path where you cloned this repository. To use the zero-dependency server instead, change `args` to `["./scripts/server.py"]`.
 
 ## Available tools
 

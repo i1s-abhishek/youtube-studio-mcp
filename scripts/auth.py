@@ -143,9 +143,12 @@ def run_auth(client_secrets: Path, token_path: Path) -> int:
     )
     token["created_at"] = int(time.time())
     token_path.parent.mkdir(parents=True, exist_ok=True)
-    with token_path.open("w", encoding="utf-8") as handle:
+    # Owner-only permissions — the token grants full channel access.
+    fd = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
         json.dump(token, handle, indent=2, sort_keys=True)
         handle.write("\n")
+    os.chmod(token_path, 0o600)
     print(f"Saved OAuth token to {token_path}")
     return 0
 

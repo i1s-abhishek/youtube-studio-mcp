@@ -3,11 +3,9 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import mimetypes
 import os
-import secrets
 import sys
 import time
 import urllib.error
@@ -20,8 +18,6 @@ from typing import Any
 
 PROTOCOL_VERSION = "2024-11-05"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
-REDIRECT_URI = "http://127.0.0.1:8765/oauth2callback"
-AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
 YOUTUBE_UPLOAD_BASE = "https://www.googleapis.com/upload/youtube/v3"
@@ -61,6 +57,16 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
         handle.write("\n")
+
+
+def write_json_private(path: Path, payload: dict[str, Any]) -> None:
+    """Write JSON readable only by the owner (0600) — for tokens and secrets."""
+    ensure_parent(path)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.chmod(path, 0o600)
 
 
 def http_json(
@@ -138,7 +144,7 @@ class AuthConfig:
         return read_json(self.token_path)
 
     def save_token(self, payload: dict[str, Any]) -> None:
-        write_json(self.token_path, payload)
+        write_json_private(self.token_path, payload)
 
     def auth_status(self) -> dict[str, Any]:
         return {
@@ -183,13 +189,16 @@ class YouTubeClient:
             raise RuntimeError("Token file is missing access_token. Run scripts/auth.py first.")
         expires_in = int(token.get("expires_in", 0))
         created_at = int(token.get("created_at", 0))
-        if created_at and expires_in:
+        if not created_at:
+            # Token file missing created_at — try refresh to get a fresh token
+            token = self._refresh_token(token)
+        else:
+            if expires_in <= 0:
+                # Missing/zero expires_in: assume Google's default 1-hour lifetime.
+                expires_in = 3600
             expiry = created_at + max(expires_in - 120, 0)
             if expiry <= int(time.time()):
                 token = self._refresh_token(token)
-        elif not created_at:
-            # Token file missing created_at — try refresh to get a fresh token
-            token = self._refresh_token(token)
         return token["access_token"]
 
     def _request(
@@ -440,7 +449,7 @@ class McpServer:
             },
             {
                 "name": "youtube_start_auth",
-                "description": "Generate the OAuth authorization URL and local auth command.",
+                "description": "Return instructions and the helper command to complete Google OAuth locally.",
                 "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
             },
             {
@@ -562,26 +571,17 @@ class McpServer:
             raise RuntimeError(
                 "client_secret.json is missing. Add your Google OAuth desktop client JSON first."
             )
-        client = self.auth.load_client_config()
-        state = secrets.token_urlsafe(24)
-        params = urllib.parse.urlencode(
-            {
-                "client_id": client["client_id"],
-                "redirect_uri": REDIRECT_URI,
-                "response_type": "code",
-                "scope": " ".join(SCOPES),
-                "access_type": "offline",
-                "prompt": "consent",
-                "state": state,
-            }
-        )
+        # Validate that the client config is readable before pointing at the helper.
+        self.auth.load_client_config()
         helper = PLUGIN_ROOT / "scripts" / "auth.py"
         return {
-            "authorization_url": f"{AUTH_URL}?{params}",
+            "instructions": (
+                "Run the helper command below in a terminal to complete Google OAuth. "
+                "It starts a local callback listener, opens the browser, and saves the token."
+            ),
+            "helper_command": f"python3 {helper} auth",
             "token_path": status["token_path"],
             "client_secrets_path": status["client_secrets_path"],
-            "helper_command": f"python3 {helper} auth",
-            "redirect_uri": REDIRECT_URI,
         }
 
     def _call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -625,33 +625,35 @@ class McpServer:
 
     @staticmethod
     def _read_message() -> dict[str, Any] | None:
-        headers: dict[str, str] = {}
+        """Read one newline-delimited JSON-RPC message (MCP stdio transport).
+
+        Returns None on EOF. Skips empty lines. Raises json.JSONDecodeError
+        on malformed input (handled by the serve loop).
+        """
         while True:
             line = sys.stdin.buffer.readline()
             if not line:
                 return None
             stripped = line.strip()
             if not stripped:
-                break
-            key, _, value = stripped.decode("utf-8").partition(":")
-            headers[key.strip().lower()] = value.strip()
-        length = int(headers.get("content-length", "0"))
-        if length <= 0:
-            return None
-        body = sys.stdin.buffer.read(length)
-        return json.loads(body.decode("utf-8"))
+                continue
+            return json.loads(stripped.decode("utf-8"))
 
     @staticmethod
     def _write_message(payload: dict[str, Any]) -> None:
-        encoded = json.dumps(payload).encode("utf-8")
-        sys.stdout.buffer.write(f"Content-Length: {len(encoded)}\r\n\r\n".encode("utf-8"))
+        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         sys.stdout.buffer.write(encoded)
+        sys.stdout.buffer.write(b"\n")
         sys.stdout.buffer.flush()
 
     def _success(self, message_id: Any, result: dict[str, Any]) -> None:
+        if message_id is None:
+            return
         self._write_message({"jsonrpc": "2.0", "id": message_id, "result": result})
 
     def _error(self, message_id: Any, code: int, message: str) -> None:
+        if message_id is None:
+            return
         self._write_message(
             {
                 "jsonrpc": "2.0",
@@ -662,10 +664,15 @@ class McpServer:
 
     def serve(self) -> None:
         while True:
-            message = self._read_message()
+            try:
+                message = self._read_message()
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                # Malformed input — skip this line and keep serving.
+                continue
             if message is None:
                 return
             message_id = message.get("id")
+            is_notification = "id" not in message
             method = message.get("method")
             try:
                 if method == "initialize":
@@ -677,7 +684,7 @@ class McpServer:
                             "serverInfo": {"name": "youtube-studio-mcp", "version": "0.1.0"},
                         },
                     )
-                elif method == "notifications/initialized":
+                elif method and method.startswith("notifications/"):
                     continue
                 elif method == "ping":
                     self._success(message_id, {})
@@ -687,10 +694,12 @@ class McpServer:
                     params = message.get("params", {})
                     result = self._call_tool(params["name"], params.get("arguments", {}))
                     self._success(message_id, {"content": [text_content(json.dumps(result, indent=2))]})
-                else:
+                elif not is_notification:
                     self._error(message_id, -32601, f"Method not found: {method}")
             except Exception as exc:  # noqa: BLE001
-                self._error(message_id, -32000, str(exc))
+                # Never send error responses for notifications (no id).
+                if not is_notification:
+                    self._error(message_id, -32000, str(exc))
 
 
 def main() -> None:
