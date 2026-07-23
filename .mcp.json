@@ -3,7 +3,7 @@
     "youtube-studio": {
       "command": "python3",
       "args": [
-        "./scripts/server.py"
+        "./scripts/mcp_server.py"
       ],
       "cwd": ".",
       "env": {

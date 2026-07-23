@@ -1,11 +1,10 @@
 # Tools
 
-The server exposes these MCP tools.
+Both servers (`scripts/mcp_server.py` and `scripts/server.py`) expose these MCP tools.
 
 | Tool | Purpose |
 | --- | --- |
 | `youtube_auth_status` | Check whether local OAuth files exist. |
-| `youtube_start_auth` | Return the auth helper command and OAuth details. |
 | `youtube_channel_overview` | Fetch channel profile, branding, uploads playlist, and public statistics. |
 | `youtube_list_videos` | List recent uploads with metadata, status, statistics, and pagination. |
 | `youtube_get_video` | Fetch metadata for a single video. |
@@ -15,6 +14,12 @@ The server exposes these MCP tools.
 | `youtube_video_analytics` | Read daily analytics for one video across a date range. |
 | `youtube_post_comment` | Post a top-level comment on a video. |
 | `youtube_list_comments` | List top-level comment threads for a video. |
+
+## server.py-only tools
+
+| Tool | Purpose |
+| --- | --- |
+| `youtube_start_auth` | Return the auth helper command (`python3 scripts/auth.py auth`) and OAuth file paths. Not available in `scripts/mcp_server.py` — run the helper directly instead. |
 
 ## Example prompts
 

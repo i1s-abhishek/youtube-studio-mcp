@@ -22,7 +22,9 @@ classifiers = [
   "Programming Language :: Python :: 3 :: Only",
   "Topic :: Internet :: WWW/HTTP",
 ]
-dependencies = []
+# Required by scripts/mcp_server.py (FastMCP server). scripts/server.py is
+# stdlib-only and needs no dependencies.
+dependencies = ["mcp"]
 
 [project.urls]
 Homepage = "https://github.com/i1s-abhishek/youtube-studio-mcp"
