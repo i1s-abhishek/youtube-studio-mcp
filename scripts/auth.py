@@ -97,7 +97,7 @@ def run_auth(client_secrets: Path, token_path: Path) -> int:
             "response_type": "code",
             "scope": " ".join(SCOPES),
             "access_type": "offline",
-            "prompt": "consent",
+            "prompt": "select_account consent",
             "state": state,
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
@@ -106,7 +106,21 @@ def run_auth(client_secrets: Path, token_path: Path) -> int:
     url = f"{AUTH_URL}?{params}"
 
     server = HTTPServer(("127.0.0.1", 8765), OAuthHandler)
-    thread = threading.Thread(target=server.handle_request, daemon=True)
+    server.timeout = 5
+
+    def serve_until_valid():
+        # Ignora callbacks obsolets (pestanyes velles del navegador que repeteixen un state
+        # antic): serveix peticions fins que arribi el state d'AQUEST intent o s'acabi el temps.
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            server.handle_request()
+            if getattr(server, "auth_state", None) == state and (
+                getattr(server, "auth_code", None) or getattr(server, "auth_error", None)
+            ):
+                return
+            server.auth_code = server.auth_error = server.auth_state = None
+
+    thread = threading.Thread(target=serve_until_valid, daemon=True)
     thread.start()
 
     print("Open this URL if your browser does not launch automatically:")
@@ -115,16 +129,14 @@ def run_auth(client_secrets: Path, token_path: Path) -> int:
     webbrowser.open(url)
 
     deadline = time.time() + 300
-    while time.time() < deadline and not getattr(server, "auth_code", None) and not getattr(
-        server, "auth_error", None
+    while time.time() < deadline and not (
+        getattr(server, "auth_state", None) == state
+        and (getattr(server, "auth_code", None) or getattr(server, "auth_error", None))
     ):
         time.sleep(0.25)
 
-    if getattr(server, "auth_error", None):
+    if getattr(server, "auth_state", None) == state and getattr(server, "auth_error", None):
         print(f"OAuth failed: {server.auth_error}", file=sys.stderr)
-        return 1
-    if getattr(server, "auth_state", None) != state:
-        print("OAuth failed: state mismatch.", file=sys.stderr)
         return 1
     if not getattr(server, "auth_code", None):
         print("OAuth failed: timed out waiting for Google callback.", file=sys.stderr)
