@@ -409,6 +409,108 @@ class YouTubeClient:
             },
         )
 
+    @staticmethod
+    def _summarize_channel(item: dict[str, Any]) -> dict[str, Any]:
+        snippet = item.get("snippet", {})
+        stats = item.get("statistics", {})
+
+        def as_int(value: Any) -> int | None:
+            return int(value) if value is not None else None
+
+        hidden = stats.get("hiddenSubscriberCount", False)
+        handle = snippet.get("customUrl")
+        return {
+            "id": item.get("id"),
+            "title": snippet.get("title"),
+            "handle": handle,
+            "url": f"https://www.youtube.com/{handle}" if handle
+            else f"https://www.youtube.com/channel/{item.get('id')}",
+            "subscriberCount": None if hidden else as_int(stats.get("subscriberCount")),
+            "subscriberCountHidden": hidden,
+            "viewCount": as_int(stats.get("viewCount")),
+            "videoCount": as_int(stats.get("videoCount")),
+            "country": snippet.get("country"),
+            "publishedAt": snippet.get("publishedAt"),
+            "description": (snippet.get("description") or "")[:300],
+        }
+
+    def channel_stats(self, channels: list[str]) -> dict[str, Any]:
+        """Look up public stats for channels given as IDs (UC...) or @handles."""
+        ids: list[str] = []
+        handles: list[str] = []
+        for raw in channels:
+            value = raw.strip().rstrip("/")
+            if "youtube.com/" in value:
+                value = value.split("youtube.com/", 1)[1]
+                if value.startswith("channel/"):
+                    value = value[len("channel/"):]
+            value = value.split("/", 1)[0].split("?", 1)[0]
+            if value.startswith("UC") and len(value) == 24:
+                ids.append(value)
+            elif value:
+                handles.append(value if value.startswith("@") else f"@{value}")
+
+        found: list[dict[str, Any]] = []
+        not_found: list[str] = []
+        part = "snippet,statistics"
+        for start in range(0, len(ids), 50):
+            batch = ids[start:start + 50]
+            response = self._request(
+                YOUTUBE_API_BASE, "/channels", query={"part": part, "id": ",".join(batch)}
+            )
+            items = response.get("items", [])
+            found.extend(self._summarize_channel(item) for item in items)
+            returned = {item.get("id") for item in items}
+            not_found.extend(cid for cid in batch if cid not in returned)
+        for handle in handles:
+            response = self._request(
+                YOUTUBE_API_BASE, "/channels", query={"part": part, "forHandle": handle}
+            )
+            items = response.get("items", [])
+            if items:
+                found.append(self._summarize_channel(items[0]))
+            else:
+                not_found.append(handle)
+        unique = list({channel["id"]: channel for channel in found}.values())
+        unique.sort(key=lambda c: c["subscriberCount"] or 0, reverse=True)
+        return {"channels": unique, "notFound": not_found}
+
+    def search_channels(
+        self,
+        query: str,
+        max_results: int = 25,
+        page_token: str | None = None,
+        order: str = "relevance",
+        region_code: str | None = None,
+    ) -> dict[str, Any]:
+        """Search public YouTube channels (costs 100 quota units per call)."""
+        search = self._request(
+            YOUTUBE_API_BASE,
+            "/search",
+            query={
+                "part": "snippet",
+                "type": "channel",
+                "q": query,
+                "maxResults": max(1, min(max_results, 50)),
+                "order": order,
+                "pageToken": page_token,
+                "regionCode": region_code,
+            },
+        )
+        ids = [
+            item.get("id", {}).get("channelId")
+            for item in search.get("items", [])
+            if item.get("id", {}).get("channelId")
+        ]
+        stats = self.channel_stats(ids) if ids else {"channels": []}
+        by_id = {channel["id"]: channel for channel in stats["channels"]}
+        return {
+            "query": query,
+            "channels": [by_id[cid] for cid in ids if cid in by_id],
+            "nextPageToken": search.get("nextPageToken"),
+            "totalResults": search.get("pageInfo", {}).get("totalResults"),
+        }
+
 
 class McpServer:
     def __init__(self) -> None:
@@ -541,6 +643,52 @@ class McpServer:
                     "additionalProperties": False,
                 },
             },
+            {
+                "name": "youtube_search_channels",
+                "description": (
+                    "Search public YouTube channels by keyword and return each match with "
+                    "subscriber, view, and video counts. Costs 100 API quota units per call "
+                    "(default daily quota is 10,000)."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "max_results": {"type": "integer", "minimum": 1, "maximum": 50},
+                        "page_token": {"type": "string"},
+                        "order": {
+                            "type": "string",
+                            "enum": ["relevance", "viewCount", "videoCount", "date", "rating", "title"],
+                        },
+                        "region_code": {
+                            "type": "string",
+                            "description": "ISO 3166-1 alpha-2 country code, e.g. US",
+                        },
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "youtube_channel_stats",
+                "description": (
+                    "Fetch public statistics for any channels, given as channel IDs (UC...), "
+                    "@handles, or channel URLs. Results are sorted by subscriber count. "
+                    "Costs 1 quota unit per 50 IDs or per handle."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "channels": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                        },
+                    },
+                    "required": ["channels"],
+                    "additionalProperties": False,
+                },
+            },
         ]
 
     def _start_auth_payload(self) -> dict[str, Any]:
@@ -608,6 +756,16 @@ class McpServer:
             return self.youtube.list_comments(
                 arguments["video_id"], int(arguments.get("max_results", 20))
             )
+        if name == "youtube_search_channels":
+            return self.youtube.search_channels(
+                arguments["query"],
+                int(arguments.get("max_results", 25)),
+                arguments.get("page_token"),
+                arguments.get("order", "relevance"),
+                arguments.get("region_code"),
+            )
+        if name == "youtube_channel_stats":
+            return self.youtube.channel_stats(arguments["channels"])
         raise RuntimeError(f"Unknown tool: {name}")
 
     # MCP stdio uses newline-delimited JSON; Content-Length framing is kept
