@@ -127,6 +127,7 @@ Core tools include:
 - `youtube_list_comments`
 - `youtube_search_channels`
 - `youtube_channel_stats`
+- `youtube_channel_videos`
 
 ## Example prompts
 

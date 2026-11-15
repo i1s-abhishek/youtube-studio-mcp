@@ -434,21 +434,116 @@ class YouTubeClient:
             "description": (snippet.get("description") or "")[:300],
         }
 
+    @staticmethod
+    def _parse_channel_ref(raw: str) -> tuple[str, str] | None:
+        """Return ("id", value) or ("handle", value) for an ID, @handle, or channel URL."""
+        value = raw.strip().rstrip("/")
+        if "youtube.com/" in value:
+            value = value.split("youtube.com/", 1)[1]
+            if value.startswith("channel/"):
+                value = value[len("channel/"):]
+        value = value.split("/", 1)[0].split("?", 1)[0]
+        if value.startswith("UC") and len(value) == 24:
+            return ("id", value)
+        if value:
+            return ("handle", value if value.startswith("@") else f"@{value}")
+        return None
+
+    @staticmethod
+    def _duration_seconds(iso: str | None) -> int | None:
+        if not iso or not iso.startswith("P"):
+            return None
+        total, number, in_time = 0, "", False
+        units = {"D": 86400, "H": 3600, "M": 60, "S": 1}
+        for char in iso[1:]:
+            if char == "T":
+                in_time = True
+            elif char.isdigit():
+                number += char
+            elif char in units and number:
+                if char == "M" and not in_time:
+                    return None  # months are not used for video durations
+                total += int(number) * units[char]
+                number = ""
+        return total
+
+    def channel_videos(self, channel: str, max_results: int = 50) -> dict[str, Any]:
+        """List a public channel's most recent uploads with per-video stats."""
+        ref = self._parse_channel_ref(channel)
+        if not ref:
+            raise ValueError("Provide a channel ID, @handle, or channel URL.")
+        key = "id" if ref[0] == "id" else "forHandle"
+        response = self._request(
+            YOUTUBE_API_BASE,
+            "/channels",
+            query={"part": "snippet,statistics,contentDetails", key: ref[1]},
+        )
+        items = response.get("items", [])
+        if not items:
+            raise RuntimeError(f"Channel {channel} not found.")
+        uploads = items[0].get("contentDetails", {}).get("relatedPlaylists", {}).get("uploads")
+        limit = max(1, min(max_results, 200))
+        video_ids: list[str] = []
+        page_token = None
+        while uploads and len(video_ids) < limit:
+            playlist = self._request(
+                YOUTUBE_API_BASE,
+                "/playlistItems",
+                query={
+                    "part": "contentDetails",
+                    "playlistId": uploads,
+                    "maxResults": min(50, limit - len(video_ids)),
+                    "pageToken": page_token,
+                },
+            )
+            video_ids.extend(
+                item["contentDetails"]["videoId"]
+                for item in playlist.get("items", [])
+                if item.get("contentDetails", {}).get("videoId")
+            )
+            page_token = playlist.get("nextPageToken")
+            if not page_token:
+                break
+        videos = []
+        for start in range(0, len(video_ids), 50):
+            details = self._request(
+                YOUTUBE_API_BASE,
+                "/videos",
+                query={
+                    "part": "snippet,statistics,contentDetails,liveStreamingDetails",
+                    "id": ",".join(video_ids[start:start + 50]),
+                },
+            )
+            for video in details.get("items", []):
+                snippet = video.get("snippet", {})
+                stats = video.get("statistics", {})
+                duration = video.get("contentDetails", {}).get("duration")
+                videos.append(
+                    {
+                        "id": video.get("id"),
+                        "title": snippet.get("title"),
+                        "publishedAt": snippet.get("publishedAt"),
+                        "durationSeconds": self._duration_seconds(duration),
+                        "wasLivestream": "liveStreamingDetails" in video,
+                        "views": int(stats["viewCount"]) if "viewCount" in stats else None,
+                        "likes": int(stats["likeCount"]) if "likeCount" in stats else None,
+                        "comments": int(stats["commentCount"]) if "commentCount" in stats else None,
+                        "tagCount": len(snippet.get("tags", [])),
+                    }
+                )
+        videos.sort(key=lambda v: v["publishedAt"] or "", reverse=True)
+        return {"channel": self._summarize_channel(items[0]), "videos": videos}
+
     def channel_stats(self, channels: list[str]) -> dict[str, Any]:
         """Look up public stats for channels given as IDs (UC...) or @handles."""
         ids: list[str] = []
         handles: list[str] = []
         for raw in channels:
-            value = raw.strip().rstrip("/")
-            if "youtube.com/" in value:
-                value = value.split("youtube.com/", 1)[1]
-                if value.startswith("channel/"):
-                    value = value[len("channel/"):]
-            value = value.split("/", 1)[0].split("?", 1)[0]
-            if value.startswith("UC") and len(value) == 24:
-                ids.append(value)
-            elif value:
-                handles.append(value if value.startswith("@") else f"@{value}")
+            ref = self._parse_channel_ref(raw)
+            if ref and ref[0] == "id":
+                ids.append(ref[1])
+            elif ref:
+                handles.append(ref[1])
 
         found: list[dict[str, Any]] = []
         not_found: list[str] = []
@@ -689,6 +784,23 @@ class McpServer:
                     "additionalProperties": False,
                 },
             },
+            {
+                "name": "youtube_channel_videos",
+                "description": (
+                    "List any public channel's most recent uploads (given as channel ID, "
+                    "@handle, or URL) with views, likes, comments, duration, and livestream "
+                    "flag. Costs about 2 quota units per 50 videos."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "channel": {"type": "string"},
+                        "max_results": {"type": "integer", "minimum": 1, "maximum": 200},
+                    },
+                    "required": ["channel"],
+                    "additionalProperties": False,
+                },
+            },
         ]
 
     def _start_auth_payload(self) -> dict[str, Any]:
@@ -766,6 +878,10 @@ class McpServer:
             )
         if name == "youtube_channel_stats":
             return self.youtube.channel_stats(arguments["channels"])
+        if name == "youtube_channel_videos":
+            return self.youtube.channel_videos(
+                arguments["channel"], int(arguments.get("max_results", 50))
+            )
         raise RuntimeError(f"Unknown tool: {name}")
 
     # MCP stdio uses newline-delimited JSON; Content-Length framing is kept
