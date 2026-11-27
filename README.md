@@ -125,6 +125,7 @@ Core tools include:
 - `youtube_video_analytics`
 - `youtube_post_comment`
 - `youtube_list_comments`
+- `youtube_get_transcript`
 - `youtube_search_channels`
 - `youtube_channel_stats`
 - `youtube_channel_videos`

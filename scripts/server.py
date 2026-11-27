@@ -63,6 +63,34 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
         handle.write("\n")
 
 
+def http_error_message(exc: urllib.error.HTTPError, body: str) -> str:
+    """Extract a readable message from Google API and OAuth error bodies.
+
+    API errors look like {"error": {"message": ...}}; OAuth token endpoint
+    errors look like {"error": "invalid_grant", "error_description": ...}.
+    """
+    fallback = body or str(exc)
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return fallback
+    if not isinstance(parsed, dict):
+        return fallback
+    error = parsed.get("error")
+    if isinstance(error, dict):
+        return str(error.get("message") or fallback)
+    if isinstance(error, str):
+        description = parsed.get("error_description")
+        message = f"{error}: {description}" if description else error
+        if error == "invalid_grant":
+            message += (
+                " — the saved refresh token is expired or revoked. Re-run"
+                " scripts/auth.py (or the youtube_start_auth tool) to re-authorize."
+            )
+        return message
+    return fallback
+
+
 def http_json(
     url: str,
     *,
@@ -78,11 +106,19 @@ def http_json(
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        try:
-            parsed = json.loads(body)
-        except json.JSONDecodeError:
-            parsed = {"error": {"message": body or str(exc)}}
-        raise RuntimeError(parsed.get("error", {}).get("message", body or str(exc))) from exc
+        raise RuntimeError(http_error_message(exc, body)) from exc
+
+
+def http_text(url: str, *, headers: dict[str, str] | None = None) -> str:
+    request = urllib.request.Request(url, method="GET")
+    for key, value in (headers or {}).items():
+        request.add_header(key, value)
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(http_error_message(exc, body)) from exc
 
 
 def http_empty(
@@ -101,11 +137,7 @@ def http_empty(
             return json.loads(body) if body else {}
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        try:
-            parsed = json.loads(body)
-        except json.JSONDecodeError:
-            parsed = {"error": {"message": body or str(exc)}}
-        raise RuntimeError(parsed.get("error", {}).get("message", body or str(exc))) from exc
+        raise RuntimeError(http_error_message(exc, body)) from exc
 
 
 @dataclass
@@ -408,6 +440,99 @@ class YouTubeClient:
                 "textFormat": "plainText",
             },
         )
+
+    def get_transcript(
+        self,
+        video_id: str,
+        language: str | None = None,
+        output_format: str = "text",
+        include_timestamps: bool = False,
+    ) -> dict[str, Any]:
+        tracks_response = self._request(
+            YOUTUBE_API_BASE,
+            "/captions",
+            query={"part": "snippet", "videoId": video_id},
+        )
+        tracks = tracks_response.get("items", [])
+        available = [
+            {
+                "id": track.get("id"),
+                "language": track.get("snippet", {}).get("language"),
+                "name": track.get("snippet", {}).get("name"),
+                "trackKind": track.get("snippet", {}).get("trackKind"),
+                "isDraft": track.get("snippet", {}).get("isDraft", False),
+            }
+            for track in tracks
+        ]
+        if not available:
+            raise RuntimeError(
+                f"No caption tracks found for video {video_id}. Auto-generated captions can take "
+                "a while to appear after upload."
+            )
+
+        candidates = [t for t in available if not t["isDraft"]] or available
+        if language:
+            wanted = language.lower()
+            matching = [
+                t
+                for t in candidates
+                if (t["language"] or "").lower() == wanted
+                or (t["language"] or "").lower().split("-")[0] == wanted.split("-")[0]
+            ]
+            if not matching:
+                langs = sorted({t["language"] or "?" for t in available})
+                raise RuntimeError(
+                    f"No caption track in language '{language}'. Available: {', '.join(langs)}"
+                )
+            candidates = matching
+        # Prefer an exact language match, then human-written tracks over auto-generated (asr).
+        wanted_lang = (language or "").lower()
+        candidates.sort(
+            key=lambda t: (
+                bool(language) and (t["language"] or "").lower() != wanted_lang,
+                t["trackKind"] == "asr",
+            )
+        )
+        chosen = candidates[0]
+
+        tfmt = "srt" if output_format == "text" else output_format
+        url = f"{YOUTUBE_API_BASE}/captions/{urllib.parse.quote(chosen['id'])}?" + (
+            urllib.parse.urlencode({"tfmt": tfmt})
+        )
+        raw = http_text(url, headers={"Authorization": f"Bearer {self._access_token()}"})
+        transcript = (
+            self._srt_to_text(raw, include_timestamps) if output_format == "text" else raw
+        )
+        return {
+            "videoId": video_id,
+            "track": chosen,
+            "format": output_format,
+            "transcript": transcript,
+            "availableTracks": available,
+        }
+
+    @staticmethod
+    def _srt_to_text(srt: str, include_timestamps: bool) -> str:
+        lines: list[str] = []
+        previous = None
+        for block in srt.replace("\r\n", "\n").strip().split("\n\n"):
+            parts = block.strip().split("\n")
+            if len(parts) < 2:
+                continue
+            if "-->" in parts[0]:
+                timing, text_lines = parts[0], parts[1:]
+            else:
+                timing, text_lines = parts[1], parts[2:]
+            text = " ".join(line.strip() for line in text_lines if line.strip())
+            if not text or text == previous:
+                continue
+            previous = text
+            if include_timestamps:
+                start = timing.split("-->")[0].strip().split(",")[0]
+                lines.append(f"[{start}] {text}")
+            else:
+                lines.append(text)
+        return "\n".join(lines) if include_timestamps else " ".join(lines)
 
     @staticmethod
     def _summarize_channel(item: dict[str, Any]) -> dict[str, Any]:
@@ -739,6 +864,42 @@ class McpServer:
                 },
             },
             {
+                "name": "youtube_get_transcript",
+                "description": (
+                    "Fetch the transcript (captions) of a video on your own channel. Prefers "
+                    "human-written tracks over auto-generated ones. Costs ~250 quota units."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "video_id": {"type": "string"},
+                        "language": {
+                            "type": "string",
+                            "description": (
+                                "BCP-47 language code, e.g. 'en'. Defaults to the best "
+                                "available track."
+                            ),
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["text", "srt", "vtt", "sbv"],
+                            "description": (
+                                "'text' returns plain transcript text; others return the raw "
+                                "caption file."
+                            ),
+                        },
+                        "include_timestamps": {
+                            "type": "boolean",
+                            "description": (
+                                "For format 'text', prefix each line with its start time."
+                            ),
+                        },
+                    },
+                    "required": ["video_id"],
+                    "additionalProperties": False,
+                },
+            },
+            {
                 "name": "youtube_search_channels",
                 "description": (
                     "Search public YouTube channels by keyword and return each match with "
@@ -867,6 +1028,13 @@ class McpServer:
         if name == "youtube_list_comments":
             return self.youtube.list_comments(
                 arguments["video_id"], int(arguments.get("max_results", 20))
+            )
+        if name == "youtube_get_transcript":
+            return self.youtube.get_transcript(
+                arguments["video_id"],
+                arguments.get("language"),
+                arguments.get("format", "text"),
+                bool(arguments.get("include_timestamps", False)),
             )
         if name == "youtube_search_channels":
             return self.youtube.search_channels(
