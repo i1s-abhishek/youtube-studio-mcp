@@ -17,6 +17,8 @@ Enable these APIs for the project:
 
 Create or update the OAuth consent screen. For personal use, an external testing app is usually enough. Add your own Google account as a test user if the app is not verified.
 
+> **Note:** While the app's publishing status is **Testing**, Google expires refresh tokens after 7 days. When that happens, tool calls fail with `invalid_grant: Token has been expired or revoked.` Re-run `scripts/auth.py` (or the `youtube_start_auth` tool) to re-authorize. To stop the weekly expiry, set the consent screen's publishing status to **In production**. Personal apps don't need verification for this, though Google will show an "unverified app" warning during sign-in.
+
 ## 4. Create OAuth credentials
 
 Create an OAuth client ID with application type `Desktop app`.

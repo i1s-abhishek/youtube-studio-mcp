@@ -15,6 +15,22 @@ The server exposes these MCP tools.
 | `youtube_video_analytics` | Read daily analytics for one video across a date range. |
 | `youtube_post_comment` | Post a top-level comment on a video. |
 | `youtube_list_comments` | List top-level comment threads for a video. |
+| `youtube_get_transcript` | Fetch a video's transcript as plain text or SRT/VTT/SBV. Your own videos only. |
+| `youtube_search_channels` | Search public channels by keyword and return each match's subscriber, view, and video counts. |
+| `youtube_channel_videos` | List any public channel's recent uploads with views, likes, comments, duration, and livestream flag. |
+| `youtube_channel_stats` | Fetch public stats for any channels given as IDs, `@handles`, or URLs, sorted by subscribers. |
+
+## API quota
+
+The YouTube Data API's default quota is 10,000 units per day. Most read calls cost 1 unit.
+`youtube_search_channels` uses `search.list`, which costs **100 units per call**, plus 1 unit for
+the follow-up stats lookup. `youtube_channel_stats` costs 1 unit per 50 channel IDs, or 1 unit per
+`@handle` (handles are resolved one at a time). `youtube_channel_videos` costs about 2 units
+per 50 videos. `youtube_get_transcript` costs about **250 units** (50 to list caption tracks plus
+200 to download one), and works only for videos on your own channel.
+
+Stats for other channels are public counts only. YouTube Analytics data is available only for
+channels you own, and subscriber counts are omitted for channels that hide them.
 
 ## Example prompts
 
@@ -32,4 +48,8 @@ Update video VIDEO_ID with this title, description, and tags.
 
 ```text
 Upload /absolute/path/to/thumbnail.png as the thumbnail for VIDEO_ID.
+```
+
+```text
+Find the most popular channels about my niche and compare their stats to mine.
 ```

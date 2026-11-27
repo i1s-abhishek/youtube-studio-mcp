@@ -35,6 +35,7 @@ See [Demo](docs/demo.md) for a setup walkthrough.
 - Upload custom thumbnails from local image files.
 - Read channel and per-video YouTube Analytics reports.
 - Post and list top-level video comments.
+- Search public channels and compare their subscriber, view, and video counts.
 - Runs locally over stdio with no hosted backend.
 - Uses only the Python standard library at runtime.
 
@@ -124,6 +125,10 @@ Core tools include:
 - `youtube_video_analytics`
 - `youtube_post_comment`
 - `youtube_list_comments`
+- `youtube_get_transcript`
+- `youtube_search_channels`
+- `youtube_channel_stats`
+- `youtube_channel_videos`
 
 ## Example prompts
 
@@ -141,6 +146,10 @@ Update this video's title, description, tags, and language.
 
 ```text
 Upload this local thumbnail image to video VIDEO_ID.
+```
+
+```text
+Find the most popular channels in my niche and compare their stats to mine.
 ```
 
 ## OAuth scopes

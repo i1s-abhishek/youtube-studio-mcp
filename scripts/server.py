@@ -63,6 +63,34 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
         handle.write("\n")
 
 
+def http_error_message(exc: urllib.error.HTTPError, body: str) -> str:
+    """Extract a readable message from Google API and OAuth error bodies.
+
+    API errors look like {"error": {"message": ...}}; OAuth token endpoint
+    errors look like {"error": "invalid_grant", "error_description": ...}.
+    """
+    fallback = body or str(exc)
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return fallback
+    if not isinstance(parsed, dict):
+        return fallback
+    error = parsed.get("error")
+    if isinstance(error, dict):
+        return str(error.get("message") or fallback)
+    if isinstance(error, str):
+        description = parsed.get("error_description")
+        message = f"{error}: {description}" if description else error
+        if error == "invalid_grant":
+            message += (
+                " — the saved refresh token is expired or revoked. Re-run"
+                " scripts/auth.py (or the youtube_start_auth tool) to re-authorize."
+            )
+        return message
+    return fallback
+
+
 def http_json(
     url: str,
     *,
@@ -78,11 +106,19 @@ def http_json(
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        try:
-            parsed = json.loads(body)
-        except json.JSONDecodeError:
-            parsed = {"error": {"message": body or str(exc)}}
-        raise RuntimeError(parsed.get("error", {}).get("message", body or str(exc))) from exc
+        raise RuntimeError(http_error_message(exc, body)) from exc
+
+
+def http_text(url: str, *, headers: dict[str, str] | None = None) -> str:
+    request = urllib.request.Request(url, method="GET")
+    for key, value in (headers or {}).items():
+        request.add_header(key, value)
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(http_error_message(exc, body)) from exc
 
 
 def http_empty(
@@ -101,11 +137,7 @@ def http_empty(
             return json.loads(body) if body else {}
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        try:
-            parsed = json.loads(body)
-        except json.JSONDecodeError:
-            parsed = {"error": {"message": body or str(exc)}}
-        raise RuntimeError(parsed.get("error", {}).get("message", body or str(exc))) from exc
+        raise RuntimeError(http_error_message(exc, body)) from exc
 
 
 @dataclass
@@ -409,6 +441,296 @@ class YouTubeClient:
             },
         )
 
+    def get_transcript(
+        self,
+        video_id: str,
+        language: str | None = None,
+        output_format: str = "text",
+        include_timestamps: bool = False,
+    ) -> dict[str, Any]:
+        tracks_response = self._request(
+            YOUTUBE_API_BASE,
+            "/captions",
+            query={"part": "snippet", "videoId": video_id},
+        )
+        tracks = tracks_response.get("items", [])
+        available = [
+            {
+                "id": track.get("id"),
+                "language": track.get("snippet", {}).get("language"),
+                "name": track.get("snippet", {}).get("name"),
+                "trackKind": track.get("snippet", {}).get("trackKind"),
+                "isDraft": track.get("snippet", {}).get("isDraft", False),
+            }
+            for track in tracks
+        ]
+        if not available:
+            raise RuntimeError(
+                f"No caption tracks found for video {video_id}. Auto-generated captions can take "
+                "a while to appear after upload."
+            )
+
+        candidates = [t for t in available if not t["isDraft"]] or available
+        if language:
+            wanted = language.lower()
+            matching = [
+                t
+                for t in candidates
+                if (t["language"] or "").lower() == wanted
+                or (t["language"] or "").lower().split("-")[0] == wanted.split("-")[0]
+            ]
+            if not matching:
+                langs = sorted({t["language"] or "?" for t in available})
+                raise RuntimeError(
+                    f"No caption track in language '{language}'. Available: {', '.join(langs)}"
+                )
+            candidates = matching
+        # Prefer an exact language match, then human-written tracks over auto-generated (asr).
+        wanted_lang = (language or "").lower()
+        candidates.sort(
+            key=lambda t: (
+                bool(language) and (t["language"] or "").lower() != wanted_lang,
+                t["trackKind"] == "asr",
+            )
+        )
+        chosen = candidates[0]
+
+        tfmt = "srt" if output_format == "text" else output_format
+        url = f"{YOUTUBE_API_BASE}/captions/{urllib.parse.quote(chosen['id'])}?" + (
+            urllib.parse.urlencode({"tfmt": tfmt})
+        )
+        raw = http_text(url, headers={"Authorization": f"Bearer {self._access_token()}"})
+        transcript = (
+            self._srt_to_text(raw, include_timestamps) if output_format == "text" else raw
+        )
+        return {
+            "videoId": video_id,
+            "track": chosen,
+            "format": output_format,
+            "transcript": transcript,
+            "availableTracks": available,
+        }
+
+    @staticmethod
+    def _srt_to_text(srt: str, include_timestamps: bool) -> str:
+        lines: list[str] = []
+        previous = None
+        for block in srt.replace("\r\n", "\n").strip().split("\n\n"):
+            parts = block.strip().split("\n")
+            if len(parts) < 2:
+                continue
+            if "-->" in parts[0]:
+                timing, text_lines = parts[0], parts[1:]
+            else:
+                timing, text_lines = parts[1], parts[2:]
+            text = " ".join(line.strip() for line in text_lines if line.strip())
+            if not text or text == previous:
+                continue
+            previous = text
+            if include_timestamps:
+                start = timing.split("-->")[0].strip().split(",")[0]
+                lines.append(f"[{start}] {text}")
+            else:
+                lines.append(text)
+        return "\n".join(lines) if include_timestamps else " ".join(lines)
+
+    @staticmethod
+    def _summarize_channel(item: dict[str, Any]) -> dict[str, Any]:
+        snippet = item.get("snippet", {})
+        stats = item.get("statistics", {})
+
+        def as_int(value: Any) -> int | None:
+            return int(value) if value is not None else None
+
+        hidden = stats.get("hiddenSubscriberCount", False)
+        handle = snippet.get("customUrl")
+        return {
+            "id": item.get("id"),
+            "title": snippet.get("title"),
+            "handle": handle,
+            "url": f"https://www.youtube.com/{handle}" if handle
+            else f"https://www.youtube.com/channel/{item.get('id')}",
+            "subscriberCount": None if hidden else as_int(stats.get("subscriberCount")),
+            "subscriberCountHidden": hidden,
+            "viewCount": as_int(stats.get("viewCount")),
+            "videoCount": as_int(stats.get("videoCount")),
+            "country": snippet.get("country"),
+            "publishedAt": snippet.get("publishedAt"),
+            "description": (snippet.get("description") or "")[:300],
+        }
+
+    @staticmethod
+    def _parse_channel_ref(raw: str) -> tuple[str, str] | None:
+        """Return ("id", value) or ("handle", value) for an ID, @handle, or channel URL."""
+        value = raw.strip().rstrip("/")
+        if "youtube.com/" in value:
+            value = value.split("youtube.com/", 1)[1]
+            if value.startswith("channel/"):
+                value = value[len("channel/"):]
+        value = value.split("/", 1)[0].split("?", 1)[0]
+        if value.startswith("UC") and len(value) == 24:
+            return ("id", value)
+        if value:
+            return ("handle", value if value.startswith("@") else f"@{value}")
+        return None
+
+    @staticmethod
+    def _duration_seconds(iso: str | None) -> int | None:
+        if not iso or not iso.startswith("P"):
+            return None
+        total, number, in_time = 0, "", False
+        units = {"D": 86400, "H": 3600, "M": 60, "S": 1}
+        for char in iso[1:]:
+            if char == "T":
+                in_time = True
+            elif char.isdigit():
+                number += char
+            elif char in units and number:
+                if char == "M" and not in_time:
+                    return None  # months are not used for video durations
+                total += int(number) * units[char]
+                number = ""
+        return total
+
+    def channel_videos(self, channel: str, max_results: int = 50) -> dict[str, Any]:
+        """List a public channel's most recent uploads with per-video stats."""
+        ref = self._parse_channel_ref(channel)
+        if not ref:
+            raise ValueError("Provide a channel ID, @handle, or channel URL.")
+        key = "id" if ref[0] == "id" else "forHandle"
+        response = self._request(
+            YOUTUBE_API_BASE,
+            "/channels",
+            query={"part": "snippet,statistics,contentDetails", key: ref[1]},
+        )
+        items = response.get("items", [])
+        if not items:
+            raise RuntimeError(f"Channel {channel} not found.")
+        uploads = items[0].get("contentDetails", {}).get("relatedPlaylists", {}).get("uploads")
+        limit = max(1, min(max_results, 200))
+        video_ids: list[str] = []
+        page_token = None
+        while uploads and len(video_ids) < limit:
+            playlist = self._request(
+                YOUTUBE_API_BASE,
+                "/playlistItems",
+                query={
+                    "part": "contentDetails",
+                    "playlistId": uploads,
+                    "maxResults": min(50, limit - len(video_ids)),
+                    "pageToken": page_token,
+                },
+            )
+            video_ids.extend(
+                item["contentDetails"]["videoId"]
+                for item in playlist.get("items", [])
+                if item.get("contentDetails", {}).get("videoId")
+            )
+            page_token = playlist.get("nextPageToken")
+            if not page_token:
+                break
+        videos = []
+        for start in range(0, len(video_ids), 50):
+            details = self._request(
+                YOUTUBE_API_BASE,
+                "/videos",
+                query={
+                    "part": "snippet,statistics,contentDetails,liveStreamingDetails",
+                    "id": ",".join(video_ids[start:start + 50]),
+                },
+            )
+            for video in details.get("items", []):
+                snippet = video.get("snippet", {})
+                stats = video.get("statistics", {})
+                duration = video.get("contentDetails", {}).get("duration")
+                videos.append(
+                    {
+                        "id": video.get("id"),
+                        "title": snippet.get("title"),
+                        "publishedAt": snippet.get("publishedAt"),
+                        "durationSeconds": self._duration_seconds(duration),
+                        "wasLivestream": "liveStreamingDetails" in video,
+                        "views": int(stats["viewCount"]) if "viewCount" in stats else None,
+                        "likes": int(stats["likeCount"]) if "likeCount" in stats else None,
+                        "comments": int(stats["commentCount"]) if "commentCount" in stats else None,
+                        "tagCount": len(snippet.get("tags", [])),
+                    }
+                )
+        videos.sort(key=lambda v: v["publishedAt"] or "", reverse=True)
+        return {"channel": self._summarize_channel(items[0]), "videos": videos}
+
+    def channel_stats(self, channels: list[str]) -> dict[str, Any]:
+        """Look up public stats for channels given as IDs (UC...) or @handles."""
+        ids: list[str] = []
+        handles: list[str] = []
+        for raw in channels:
+            ref = self._parse_channel_ref(raw)
+            if ref and ref[0] == "id":
+                ids.append(ref[1])
+            elif ref:
+                handles.append(ref[1])
+
+        found: list[dict[str, Any]] = []
+        not_found: list[str] = []
+        part = "snippet,statistics"
+        for start in range(0, len(ids), 50):
+            batch = ids[start:start + 50]
+            response = self._request(
+                YOUTUBE_API_BASE, "/channels", query={"part": part, "id": ",".join(batch)}
+            )
+            items = response.get("items", [])
+            found.extend(self._summarize_channel(item) for item in items)
+            returned = {item.get("id") for item in items}
+            not_found.extend(cid for cid in batch if cid not in returned)
+        for handle in handles:
+            response = self._request(
+                YOUTUBE_API_BASE, "/channels", query={"part": part, "forHandle": handle}
+            )
+            items = response.get("items", [])
+            if items:
+                found.append(self._summarize_channel(items[0]))
+            else:
+                not_found.append(handle)
+        unique = list({channel["id"]: channel for channel in found}.values())
+        unique.sort(key=lambda c: c["subscriberCount"] or 0, reverse=True)
+        return {"channels": unique, "notFound": not_found}
+
+    def search_channels(
+        self,
+        query: str,
+        max_results: int = 25,
+        page_token: str | None = None,
+        order: str = "relevance",
+        region_code: str | None = None,
+    ) -> dict[str, Any]:
+        """Search public YouTube channels (costs 100 quota units per call)."""
+        search = self._request(
+            YOUTUBE_API_BASE,
+            "/search",
+            query={
+                "part": "snippet",
+                "type": "channel",
+                "q": query,
+                "maxResults": max(1, min(max_results, 50)),
+                "order": order,
+                "pageToken": page_token,
+                "regionCode": region_code,
+            },
+        )
+        ids = [
+            item.get("id", {}).get("channelId")
+            for item in search.get("items", [])
+            if item.get("id", {}).get("channelId")
+        ]
+        stats = self.channel_stats(ids) if ids else {"channels": []}
+        by_id = {channel["id"]: channel for channel in stats["channels"]}
+        return {
+            "query": query,
+            "channels": [by_id[cid] for cid in ids if cid in by_id],
+            "nextPageToken": search.get("nextPageToken"),
+            "totalResults": search.get("pageInfo", {}).get("totalResults"),
+        }
+
 
 class McpServer:
     def __init__(self) -> None:
@@ -541,6 +863,105 @@ class McpServer:
                     "additionalProperties": False,
                 },
             },
+            {
+                "name": "youtube_get_transcript",
+                "description": (
+                    "Fetch the transcript (captions) of a video on your own channel. Prefers "
+                    "human-written tracks over auto-generated ones. Costs ~250 quota units."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "video_id": {"type": "string"},
+                        "language": {
+                            "type": "string",
+                            "description": (
+                                "BCP-47 language code, e.g. 'en'. Defaults to the best "
+                                "available track."
+                            ),
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["text", "srt", "vtt", "sbv"],
+                            "description": (
+                                "'text' returns plain transcript text; others return the raw "
+                                "caption file."
+                            ),
+                        },
+                        "include_timestamps": {
+                            "type": "boolean",
+                            "description": (
+                                "For format 'text', prefix each line with its start time."
+                            ),
+                        },
+                    },
+                    "required": ["video_id"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "youtube_search_channels",
+                "description": (
+                    "Search public YouTube channels by keyword and return each match with "
+                    "subscriber, view, and video counts. Costs 100 API quota units per call "
+                    "(default daily quota is 10,000)."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "max_results": {"type": "integer", "minimum": 1, "maximum": 50},
+                        "page_token": {"type": "string"},
+                        "order": {
+                            "type": "string",
+                            "enum": ["relevance", "viewCount", "videoCount", "date", "rating", "title"],
+                        },
+                        "region_code": {
+                            "type": "string",
+                            "description": "ISO 3166-1 alpha-2 country code, e.g. US",
+                        },
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "youtube_channel_stats",
+                "description": (
+                    "Fetch public statistics for any channels, given as channel IDs (UC...), "
+                    "@handles, or channel URLs. Results are sorted by subscriber count. "
+                    "Costs 1 quota unit per 50 IDs or per handle."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "channels": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                        },
+                    },
+                    "required": ["channels"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "youtube_channel_videos",
+                "description": (
+                    "List any public channel's most recent uploads (given as channel ID, "
+                    "@handle, or URL) with views, likes, comments, duration, and livestream "
+                    "flag. Costs about 2 quota units per 50 videos."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "channel": {"type": "string"},
+                        "max_results": {"type": "integer", "minimum": 1, "maximum": 200},
+                    },
+                    "required": ["channel"],
+                    "additionalProperties": False,
+                },
+            },
         ]
 
     def _start_auth_payload(self) -> dict[str, Any]:
@@ -608,30 +1029,70 @@ class McpServer:
             return self.youtube.list_comments(
                 arguments["video_id"], int(arguments.get("max_results", 20))
             )
+        if name == "youtube_get_transcript":
+            return self.youtube.get_transcript(
+                arguments["video_id"],
+                arguments.get("language"),
+                arguments.get("format", "text"),
+                bool(arguments.get("include_timestamps", False)),
+            )
+        if name == "youtube_search_channels":
+            return self.youtube.search_channels(
+                arguments["query"],
+                int(arguments.get("max_results", 25)),
+                arguments.get("page_token"),
+                arguments.get("order", "relevance"),
+                arguments.get("region_code"),
+            )
+        if name == "youtube_channel_stats":
+            return self.youtube.channel_stats(arguments["channels"])
+        if name == "youtube_channel_videos":
+            return self.youtube.channel_videos(
+                arguments["channel"], int(arguments.get("max_results", 50))
+            )
         raise RuntimeError(f"Unknown tool: {name}")
+
+    # MCP stdio uses newline-delimited JSON; Content-Length framing is kept
+    # for clients that send it. Replies mirror whichever framing was received.
+    _use_headers = False
 
     @staticmethod
     def _read_message() -> dict[str, Any] | None:
-        headers: dict[str, str] = {}
         while True:
             line = sys.stdin.buffer.readline()
             if not line:
                 return None
-            if line == b"\r\n":
-                break
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith(b"{"):
+                McpServer._use_headers = False
+                return json.loads(stripped.decode("utf-8"))
+            break
+        headers: dict[str, str] = {}
+        while True:
             key, _, value = line.decode("utf-8").partition(":")
             headers[key.strip().lower()] = value.strip()
+            line = sys.stdin.buffer.readline()
+            if not line:
+                return None
+            if line in (b"\r\n", b"\n"):
+                break
         length = int(headers.get("content-length", "0"))
         if length <= 0:
             return None
+        McpServer._use_headers = True
         body = sys.stdin.buffer.read(length)
         return json.loads(body.decode("utf-8"))
 
     @staticmethod
     def _write_message(payload: dict[str, Any]) -> None:
         encoded = json.dumps(payload).encode("utf-8")
-        sys.stdout.buffer.write(f"Content-Length: {len(encoded)}\r\n\r\n".encode("utf-8"))
-        sys.stdout.buffer.write(encoded)
+        if McpServer._use_headers:
+            sys.stdout.buffer.write(f"Content-Length: {len(encoded)}\r\n\r\n".encode("utf-8"))
+            sys.stdout.buffer.write(encoded)
+        else:
+            sys.stdout.buffer.write(encoded + b"\n")
         sys.stdout.buffer.flush()
 
     def _success(self, message_id: Any, result: dict[str, Any]) -> None:
